@@ -1,0 +1,16 @@
+# Local model downloads and logs
+qwen-local-setup/downloads/
+qwen-local-setup/user-tests.log
+qwen-local-setup/test-results.json
+
+# Local chat history and generated runtime data
+qwen-local-setup/chat/data/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+
+# Editor and OS files
+.DS_Store
+.vscode/
+.idea/
