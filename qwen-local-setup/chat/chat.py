@@ -11,7 +11,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from csv_support import dataset_context, inspect_csv
+from csv_support import dataset_context, inspect_csv, parse_csv_argument, refresh_csv
 from monitoring import format_stats
 
 ROOT = Path(__file__).resolve().parent
@@ -186,7 +186,10 @@ HELP = """Commands:
   :chats          List conversations
   :load <id>      Resume a conversation
   :multi          Multiline input; finish with a line containing :end
-  :csv <path>     Inspect and attach a UTF-8 CSV (path may contain spaces)
+  :csv --header <path>     Attach a CSV whose first record contains column names
+  :csv --no-header <path>  Attach a CSV whose first record is data
+                          Add --numeric before the path to require finite numbers in all cells
+                          Optional: --delimiter comma|semicolon|tab|pipe before the path
   :files          Show attached dataset summaries
   :history        Display saved questions and final answers
   :stats          Current resources and last response metrics
@@ -224,7 +227,7 @@ def export_answer(answer, filename):
 
 
 class ChatApp:
-    def __init__(self, store, client, prompt_path, num_ctx=4096, output_tokens=2048):
+    def __init__(self, store, client, prompt_path, num_ctx=8192, output_tokens=4096):
         self.store, self.client = store, client
         self.prompt_path = Path(prompt_path).expanduser()
         self.num_ctx, self.output_tokens = num_ctx, output_tokens
@@ -240,7 +243,9 @@ class ChatApp:
             system = self.prompt_path.read_text(encoding="utf-8").strip()
             if not system:
                 raise ValueError("System prompt is empty; edit the prompt file before sending.")
-            attachments = self.store.attachments(self.chat_id)
+            attachments = [refresh_csv(item) for item in self.store.attachments(self.chat_id)]
+            for item in attachments:
+                self.store.attach(self.chat_id, item)
             messages, context = build_context(system, self.store.complete_turns(self.chat_id), attachments,
                                                 question, self.num_ctx, self.output_tokens)
             context["total_saved_turns"] = self.store.turn_count(self.chat_id)
@@ -307,9 +312,13 @@ class ChatApp:
             self.chat_id = chat["id"]
             print(f"Loaded conversation {self.chat_id}: {chat['title']}. Use :history to see saved messages.")
         elif command == ":csv":
-            metadata = inspect_csv(argument)
+            filename, options = parse_csv_argument(argument)
+            metadata = inspect_csv(filename, **options)
             self.store.attach(self.chat_id, metadata)
             print(f"Attached {metadata['path']}: {metadata['rows']} rows × {metadata['column_count']} columns.")
+            print("Header: first record contains column names." if metadata["has_header"] else "No header: first record retained as data; columns named column_1, column_2, etc.")
+            for warning in metadata["warnings"]:
+                print(f"Warning: {warning}")
             print(json.dumps(metadata, ensure_ascii=False, indent=2))
         elif command == ":files":
             print(json.dumps(self.store.attachments(self.chat_id), ensure_ascii=False, indent=2))
@@ -352,11 +361,11 @@ def main(argv=None):
     parser.add_argument("--db", type=Path, default=ROOT / "data" / "chats.sqlite3")
     parser.add_argument("--prompt", type=Path, default=ROOT / "system_prompt.txt")
     parser.add_argument("--host", default="http://127.0.0.1:11434")
-    parser.add_argument("--num-ctx", type=int, default=4096, help="256–4096; larger contexts require a separate test")
-    parser.add_argument("--response-tokens", type=int, default=2048, help="Reserve for thinking plus answer, within the context")
+    parser.add_argument("--num-ctx", type=int, default=8192, help="256–8192 tokens (default: 8192)")
+    parser.add_argument("--response-tokens", type=int, default=4096, help="Reserve for thinking plus answer, within the context (default: 4096)")
     args = parser.parse_args(argv)
-    if not 256 <= args.num_ctx <= 4096:
-        parser.error("Context must be between 256 and 4096. 8192 has not been tested; no automatic increase is allowed.")
+    if not 256 <= args.num_ctx <= 8192:
+        parser.error("Context must be between 256 and 8192.")
     if not 1 <= args.response_tokens < args.num_ctx - 256:
         parser.error("--response-tokens must be positive and leave at least 256 tokens plus input space.")
     if not args.prompt.is_file():

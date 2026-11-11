@@ -1,6 +1,8 @@
 # Phase 2 validation
 
 Implementation is complete. No additional packages were installed.
+The original results below used 4096 context. See the CSV handling update at
+the end for the current application behavior and offline checks.
 
 ## Offline tests
 
@@ -73,7 +75,7 @@ SHA-256 comparisons against pre-implementation snapshots passed for:
 All Phase 2 files are under `chat/`. No GPU drivers, Ollama installation,
 existing model files or existing model/service settings were changed.
 
-## Limits
+## Original validation limits
 
 Context estimates are heuristic, not exact tokenizer counts. Only recent
 complete turns that fit are resent; old content remains in SQLite. Long
@@ -81,3 +83,33 @@ thinking or code may reach the output limit; this is reported and saved.
 CSV metadata is an attachment-time snapshot, with up to three sample rows;
 the full dataset is never sent. CSV inspection is limited to UTF-8 files up
 to 64 MiB and 100 columns. Mathematical answers still require checking.
+
+## CSV handling update — 2026-11-11
+
+The app now requires an explicit `--header` or `--no-header` choice. Headerless
+records are retained and assigned stable column names. Exact Pandas loading
+options accompany metadata, preserving string cells, NA literals and blank
+records. Full-file numeric/non-numeric counts and bounded bad-cell locations
+are supplied even when random samples are removed from context. Optional
+`--numeric` blocks missing, non-finite and non-numeric data before inference.
+Delimiter overrides support ambiguous inputs; malformed non-comma files no
+longer silently fall back to a single comma-separated column.
+
+Attachments are rescanned before each question. Legacy attachments require a
+new header choice; saved chats are retained. Files changing during inspection
+block the request. No original datasets or saved user conversations were edited.
+
+44 offline tests passed on `/usr/bin/python3` (3.10), including a round-trip
+check with the already installed Pandas. On `python3` (3.13), 43 passed and the
+optional Pandas check was skipped because Pandas is not installed there. No
+packages were installed, no model inference was requested, and no generated
+model code was executed. Tests cover the parsing options reaching the model,
+first-row preservation, anomalies outside random samples, blank/NA handling,
+numeric validation, rescan behavior and legacy attachment rejection.
+
+The current defaults are 8192 context and 4096 thinking/answer tokens. The
+existing smoke script now explicitly selects 8192/4096 to accommodate longer
+custom system prompts; it was updated for the new CSV syntax but was not rerun.
+Long 8192-context inference and model-generated mathematical correctness
+remain unverified. The full dataset remains local; the model receives bounded
+metadata and instructions to generate code that loads the complete file.

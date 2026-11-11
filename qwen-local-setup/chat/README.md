@@ -74,7 +74,7 @@ dataset metadata. The last selected conversation ID is also saved. Use
 in SQLite, separate from final answers. Nothing in older history is deleted
 when it leaves the model's context.
 
-Default `num_ctx` is **4096**. The app reserves **2048 tokens for thinking plus
+Default `num_ctx` is **8192**. The app reserves **4096 tokens for thinking plus
 the answer**, and 256 for overhead/estimation margin. Input is budgeted with a
 conservative UTF-8-byte heuristic (roughly two bytes per token). This is not
 the exact Qwen tokenizer. The request always contains the editable system
@@ -93,8 +93,10 @@ excluded from later model context.
 The estimate cannot guarantee exact token fit for every language or unusual
 code. Ollama may impose its own context handling. Long thinking can consume
 the entire output reserve, leaving no final answer; this is reported explicitly.
-No automatic retry disables thinking or increases context. A short smoke test
-does not establish that long optimization assignments fit this budget.
+No automatic retry disables thinking or increases context. The 8192 context is
+not yet stress tested with long assignments; it can use more RAM/VRAM than
+4096. If the system becomes slow or memory constrained, use the lower settings
+shown below.
 
 Options, without editing the service/model configuration:
 
@@ -102,19 +104,21 @@ Options, without editing the service/model configuration:
 /usr/bin/python3 /home/jaineel/TestingLLMLocal/qwen-local-setup/chat/chat.py \
   --db /path/to/my-chats.sqlite3 \
   --prompt /path/to/instructions.txt \
-  --num-ctx 4096 --response-tokens 2048
+  --num-ctx 8192 --response-tokens 4096
 ```
 
-Context is configurable up to 4096 in this version. **8192 is rejected** until
-a separate memory/performance test and deliberate code change are performed.
-Reducing the output reserve allows more input, but less room for thinking and
-the answer. The exact model and thinking requirement cannot be switched off
-through application flags. `--host` supports a loopback HTTP Ollama endpoint.
+Context is configurable up to 8192 in this version. The app sends the chosen
+context to Ollama with each request; the service's 4096 default does not limit
+these explicit per-request settings. If needed, run with
+`--num-ctx 4096 --response-tokens 2048`. Reducing the output reserve allows
+more input, but leaves less room for thinking and the answer. The exact model
+and thinking requirement cannot be switched off through application flags.
+`--host` supports a loopback HTTP Ollama endpoint.
 
 ## CSV attachments
 
 ```text
-:csv /home/jaineel/datasets/housing.csv
+:csv --header /home/jaineel/datasets/housing.csv
 :files
 :multi
 Use area and bedrooms to predict price.
@@ -123,30 +127,66 @@ Generate code that loads the complete attached CSV.
 :end
 ```
 
-Paths may contain spaces; do not add shell quotes inside the app. Attachments
-belong to the selected conversation and persist across restarts. Reattaching
-the same absolute path refreshes that attachment's metadata. Switching to a
-new conversation gives an empty attachment list.
+Choose the header explicitly so a data record is never silently used as column
+names. `--header` means the first record contains names; `--no-header` keeps
+the first record as data and assigns `column_1`, `column_2`, etc. Even numeric
+headers are supported when explicitly selected. Header presence cannot be
+reliably guessed for arbitrary categorical datasets. Bare `:csv <path>` gives
+instructions instead of attaching with a guess.
+
+```text
+:csv --no-header /home/jaineel/datasets/two-column-data.csv
+:csv --header --numeric /home/jaineel/datasets/numbers.csv
+:csv --header --delimiter semicolon /home/jaineel/datasets/table.csv
+```
+
+`--numeric` is optional: it requires every cell in every column to contain a
+finite number, rejecting blanks, text, booleans and NaN/Inf with the exact
+column, data-row number and physical line. Omit it for categorical/mixed
+datasets or intentional placeholders. Delimiter detection handles comma,
+semicolon, tab and pipe; use `--delimiter comma|semicolon|tab|pipe` to override.
+All options go before the path. Paths may contain spaces; do not add shell
+quotes inside the app.
+
+Attachments belong to the selected conversation and persist across restarts.
+Reattaching the same absolute path updates its parsing choices. Switching to a
+new conversation gives an empty attachment list. Attachments saved by the old
+version must be reattached with a header choice before another model request;
+old chats and saved responses are retained.
 
 The CSV module scans UTF-8/UTF-8-BOM files, infers comma/semicolon/tab/pipe
 delimiters, and reports row/column counts, exact column names, basic inferred
 types, blank/whitespace missing counts, numeric min/max, and up to three
-deterministically sampled rows. Missing markers such as `NA` remain literal
-strings. Types are heuristic; the sample is illustrative, not a guarantee of
-all categories or outliers. Sample cells longer than 160 characters are marked
-as truncated. Counts and ranges come from scanning the file, not the sample.
+deterministically sampled rows. Each column also has numeric/non-numeric counts
+and up to three non-numeric examples and missing locations, recorded with data
+row numbers and physical line numbers. Mixed columns get a visible warning.
+These diagnostics survive context-driven sample removal, so a rare bad value
+does not disappear merely because it was absent from the random sample.
+Missing markers such as `NA` remain literal strings, not automatically missing
+values. Physically blank records count as rows of missing cells. Counts and
+ranges cover the whole file. Types are heuristic; samples are illustrative.
+Sample/diagnostic cells longer than 160 characters are marked as truncated.
 
 Only this bounded metadata enters context. The model receives the absolute
-path, encoding and delimiter, and instructions to generate code loading the
-**full CSV** for actual computations. The application does not compute fitted
-solutions or execute the generated code. A header row is required: the first
-record is treated as column names; headerless files cannot be reliably detected.
-Duplicate/empty headers, ragged or malformed records, non-UTF-8 and unreadable
-files are rejected with an error.
+path and exact `pd.read_csv` options: header mode, synthetic names when needed,
+delimiter, encoding, string dtype, quoting rules, and preservation of blank
+records/literal NA strings. It is instructed to load the **full CSV**, and to
+handle missing/non-numeric cells only as explicitly requested. It must not
+silently drop records, coerce invalid cells to NaN, invent replacements, or
+claim execution. `--numeric` supplies an application-level numeric check before
+inference; without it, the model must validate the columns selected for numeric
+work. The application does not compute fitted solutions or execute generated
+code. CSV handling cannot guarantee the correctness of model-generated code.
+Duplicate/empty headers, ragged or malformed records, empty datasets, NUL bytes,
+non-UTF-8 and unreadable files are rejected with an error.
 Limits: 64 MiB, 100 columns, 256 characters per header, and Python csv's default
 field-length limit (normally 128 KiB). PDF/Excel/notebook uploads are unsupported.
-Metadata is a snapshot: reattach a file after changing it. Persisted paths must
-still exist where the generated notebook code runs.
+The file is rescanned with its saved header/delimiter choices before every
+model request; updated metadata is saved, and strict numeric requirements are
+checked again. A file changing during inspection blocks the request. Full-file
+SHA-256 fingerprints are saved with the metadata. Generated code still refers
+to the local path: it must exist, and later file changes may affect results
+when that code is eventually run.
 
 ## Resource statistics
 
@@ -170,7 +210,7 @@ Offline tests (no model calls):
 ```
 
 Optional real-server smoke test (two short inference requests in separate
-CLI processes, default 4096 context and thinking enabled):
+CLI processes, 8192 context and thinking enabled; not rerun since the CSV update):
 
 ```bash
 /usr/bin/python3 /home/jaineel/TestingLLMLocal/qwen-local-setup/chat/tests/smoke_test.py

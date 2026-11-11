@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from chat import ChatApp, MODEL, OllamaClient, ROOT, Store, build_context, estimate_tokens, export_answer, main, read_question
-from csv_support import dataset_context, inspect_csv
+from csv_support import dataset_context, inspect_csv, parse_csv_argument
 import monitoring
 
 
@@ -65,7 +65,8 @@ class AppTests(unittest.TestCase):
         self.assertIn("Answer", output)
         self.assertNotIn("Check first", output)
         request = self.client.requests[0]
-        self.assertEqual(request["num_ctx"], 4096)
+        self.assertEqual(request["num_ctx"], 8192)
+        self.assertEqual(request["output_tokens"], 4096)
         self.assertEqual(request["messages"][0], {"role": "system", "content": self.prompt.read_text()})
         metrics = json.loads(answer["metrics"])
         self.assertIs(metrics["think"], True)
@@ -90,7 +91,7 @@ class AppTests(unittest.TestCase):
         self.ask("Remember coefficient 17.")
         csv_file = self.root / "data.csv"
         csv_file.write_text("area,bedrooms,price\n100,2,300\n")
-        self.store.attach(self.app.chat_id, inspect_csv(csv_file))
+        self.store.attach(self.app.chat_id, inspect_csv(csv_file, has_header=True))
         old_id = self.app.chat_id
         self.store.close()
         self.store = Store(self.db)
@@ -125,12 +126,55 @@ class AppTests(unittest.TestCase):
         path = self.root / "my dataset.csv"
         path.write_text("area,bedrooms,Sale Price\n100,2,300\n110,,350\n")
         with contextlib.redirect_stdout(io.StringIO()) as output:
-            self.app.command(f":csv {path}")
+            self.app.command(f":csv --header {path}")
         self.assertIn("2 rows × 3 columns", output.getvalue())
         self.ask("Generate regression code.")
         request = json.dumps(self.client.requests[-1]["messages"])
-        for text in [str(path), "Sale Price", "bedrooms", "missing", "full file"]:
+        for text in [str(path), "Sale Price", "bedrooms", "missing", "full file", "read_csv_options"]:
             self.assertIn(text, request)
+
+    def test_legacy_csv_blocks_request_until_header_choice(self):
+        self.store.attach(self.app.chat_id, {"path": "/old.csv", "rows": 99})
+        answer, output = self.ask("Use the CSV")
+        self.assertEqual(answer["status"], "error")
+        self.assertFalse(self.client.requests)
+        self.assertIn("Reattach", output)
+
+    def test_headerless_metadata_and_rare_values_reach_model(self):
+        path = self.root / "dataset.csv"
+        path.write_text("6.5,55.3\nr,29.4\n")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.app.command(f":csv --no-header {path}")
+        self.ask("Generate code using both columns")
+        context = self.client.requests[-1]["messages"][1]["content"]
+        metadata = json.loads(context.split("\n", 1)[1])[0]
+        self.assertEqual(metadata["rows"], 2)
+        self.assertIsNone(metadata["read_csv_options"]["header"])
+        self.assertEqual(metadata["samples"][0]["values"], ["6.5", "55.3"])
+        self.assertEqual(metadata["columns"][0]["non_numeric_examples"][0]["value"], "r")
+
+    def test_csv_is_rescanned_before_each_request(self):
+        path = self.root / "data.csv"
+        path.write_text("x,y\n1,2\n")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.app.command(f":csv --header {path}")
+        path.write_text("x,y\n1,2\n3,bad\n")
+        self.ask("Use the current CSV")
+        metadata = self.store.attachments(self.app.chat_id)[0]
+        self.assertEqual(metadata["rows"], 2)
+        self.assertEqual(metadata["columns"][1]["non_numeric_examples"][0]["value"], "bad")
+        self.assertIn('"value":"bad"', self.client.requests[-1]["messages"][1]["content"])
+
+    def test_strict_numeric_csv_change_blocks_model_request(self):
+        path = self.root / "data.csv"
+        path.write_text("1,2\n3,4\n")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.app.command(f":csv --no-header --numeric {path}")
+        path.write_text("1,2\n3,invalid\n")
+        answer, output = self.ask("Fit the data")
+        self.assertEqual(answer["status"], "error")
+        self.assertFalse(self.client.requests)
+        self.assertIn("invalid", output)
 
     def test_multiline_preserves_equations_and_blank_lines(self):
         lines = iter(["min f(x) = x^2", "", "    x >= 0", ":end"])
@@ -233,12 +277,12 @@ class ProtocolTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     list(client.stream([], 4096, 2048))
 
-    def test_remote_host_and_untested_context_rejected(self):
+    def test_remote_host_and_unsupported_context_rejected(self):
         for host in ["http://example.com", "https://localhost", "http://localhost/path", "http://user@localhost"]:
             with self.assertRaises(ValueError):
                 OllamaClient(host)
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
-            main(["--num-ctx", "8192"])
+            main(["--num-ctx", "16384"])
         self.assertEqual(error.exception.code, 2)
 
     def test_context_keeps_recent_complete_pairs(self):
@@ -250,7 +294,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertLessEqual(info["estimated_input_tokens"], info["input_budget"])
 
     def test_real_prompt_fits_default_context_with_short_question(self):
-        _, info = build_context((ROOT / "system_prompt.txt").read_text(), [], [], "What is gradient descent?", 4096, 2048)
+        _, info = build_context((ROOT / "system_prompt.txt").read_text(), [], [], "What is gradient descent?", 8192, 4096)
         self.assertLess(info["estimated_input_tokens"], info["input_budget"])
 
 
@@ -264,7 +308,7 @@ class CsvTests(unittest.TestCase):
 
     def inspect(self, text):
         self.path.write_text(text, encoding="utf-8")
-        return inspect_csv(self.path)
+        return inspect_csv(self.path, has_header=True)
 
     def test_schema_missing_types_and_numeric_ranges(self):
         result = self.inspect(' exact name ,price,flag,empty\n1,3.5,true,\n2,,false, \n3,8,true,\n')
@@ -302,7 +346,7 @@ class CsvTests(unittest.TestCase):
         self.assertEqual(result["rows"], 1000)
         self.assertEqual(len(result["samples"]), 3)
         self.assertEqual(result["columns"][1]["max"], 1998)
-        self.assertLess(len(dataset_context([result])), 2000)
+        self.assertLess(len(dataset_context([result])), 2500)
         self.assertIn('"samples":[]', dataset_context([result], 0))
 
     def test_malformed_duplicate_empty_invalid_encoding(self):
@@ -311,14 +355,14 @@ class CsvTests(unittest.TestCase):
                 self.inspect(text)
         self.path.write_bytes(b"x,y\n\xff,2\n")
         with self.assertRaises(ValueError):
-            inspect_csv(self.path)
+            inspect_csv(self.path, has_header=True)
 
     def test_missing_permission_and_size_errors(self):
         with self.assertRaises(ValueError):
-            inspect_csv(self.path)
+            inspect_csv(self.path, has_header=True)
         self.path.write_text("x\n1\n")
         with patch("csv_support.MAX_BYTES", 1), self.assertRaises(ValueError):
-            inspect_csv(self.path)
+            inspect_csv(self.path, has_header=True)
         with patch.object(Path, "open", side_effect=PermissionError("denied")), self.assertRaises(ValueError):
             inspect_csv(self.path)
 
@@ -326,6 +370,69 @@ class CsvTests(unittest.TestCase):
         result = self.inspect("x,y\n" + "a"*1000 + ",1\ntext,word\n")
         self.assertLess(len(result["samples"][0]["values"][0]), 200)
         self.assertNotIn("min", result["columns"][1])
+
+    def test_explicit_header_choice_and_paths_with_spaces(self):
+        for argument in [str(self.path), "--header --no-header x.csv", "--header", "--unknown x.csv"]:
+            with self.subTest(argument=argument), self.assertRaises(ValueError):
+                parse_csv_argument(argument)
+        path, options = parse_csv_argument("--no-header --numeric /tmp/my data.csv")
+        self.assertEqual(path, "/tmp/my data.csv")
+        self.assertEqual(options, {"has_header": False, "numeric": True})
+        _, options = parse_csv_argument("--header --delimiter semicolon /tmp/my data.csv")
+        self.assertEqual(options["delimiter"], ";")
+
+    def test_ragged_noncomma_files_cannot_pass_as_single_column(self):
+        for separator in [";", "\t", "|"]:
+            with self.subTest(separator=separator), self.assertRaisesRegex(ValueError, "expected 2 fields"):
+                self.inspect(f"x{separator}y\n1{separator}2{separator}3\n")
+
+    def test_explicit_delimiter_and_ambiguous_fallback(self):
+        self.path.write_text("x;y,z\n1;2,3;4\n5;6,7,8\n")
+        with self.assertRaisesRegex(ValueError, "delimiter is ambiguous"):
+            inspect_csv(self.path, has_header=True)
+        self.path.write_text("x;y,z\n1;2,3;4\n")
+        result = inspect_csv(self.path, has_header=True, delimiter=",")
+        self.assertEqual([column["name"] for column in result["columns"]], ["x;y", "z"])
+
+    def test_headerless_first_record_and_numeric_headers(self):
+        self.path.write_text("6.5,55.3\n2.9,52.5\n")
+        with self.assertRaises(ValueError):
+            inspect_csv(self.path)
+        result = inspect_csv(self.path, has_header=False)
+        self.assertEqual(result["rows"], 2)
+        self.assertEqual(result["samples"][0]["values"], ["6.5", "55.3"])
+        self.assertIsNone(result["read_csv_options"]["header"])
+        self.assertEqual(result["read_csv_options"]["names"], ["column_1", "column_2"])
+        # Numeric-looking names are legal when the user explicitly chooses headers.
+        result = inspect_csv(self.path, has_header=True)
+        self.assertEqual(result["rows"], 1)
+        self.assertEqual(result["columns"][0]["name"], "6.5")
+
+    def test_anomaly_outside_random_samples_stays_in_context(self):
+        result = self.inspect("x,y\n" + "1,2\n" * 999 + "r,29.4\n")
+        column = result["columns"][0]
+        self.assertEqual((column["numeric_count"], column["non_numeric_count"]), (999, 1))
+        self.assertEqual(column["non_numeric_examples"], [{"row": 1000, "line": 1001, "value": "r"}])
+        self.assertTrue(all(sample["values"][0] != "r" for sample in result["samples"]))
+        self.assertIn('"value":"r"', dataset_context([result], 0))
+        self.assertTrue(result["warnings"])
+
+    def test_numeric_validation_rejects_missing_nonfinite_and_text(self):
+        for value in ["r", "NaN", "inf", "-inf", "NA", "", " "]:
+            self.path.write_text(f"x,y\n1,2\n3,{value}\n")
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "data row 2, line 3"):
+                inspect_csv(self.path, has_header=True, numeric=True)
+        self.path.write_text("x,y\n1,2\n3,4\n")
+        self.assertTrue(inspect_csv(self.path, has_header=True, numeric=True)["numeric_required"])
+
+    def test_blank_records_and_literal_missing_markers_preserved(self):
+        result = self.inspect("x,y\n1,NA\n\n3,4\n")
+        self.assertEqual(result["rows"], 3)
+        self.assertEqual(result["columns"][0]["missing"], 1)
+        self.assertEqual(result["columns"][1]["non_numeric_examples"][0]["value"], "NA")
+        self.assertIs(result["read_csv_options"]["keep_default_na"], False)
+        self.assertIs(result["read_csv_options"]["skip_blank_lines"], False)
+        self.assertEqual(len(result["sha256"]), 64)
 
 
 class StatsTests(unittest.TestCase):
